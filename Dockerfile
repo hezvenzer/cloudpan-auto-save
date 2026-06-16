@@ -1,60 +1,54 @@
 # ── 构建阶段 ──────────────────────────────────────────────────────────────────
-# 使用 BUILDPLATFORM 加速跨平台构建（在 x86 宿主机上执行 yarn install / node-gyp）
+# 仅用于编译 TypeScript 和准备前端资源（不处理原生模块）
 FROM --platform=$BUILDPLATFORM node:18-alpine AS builder
 
 WORKDIR /home
 
-# 先复制依赖清单，充分利用 Docker 层缓存
 COPY package.json yarn.lock ./
 
-# 安装构建工具链（armv7 下 better-sqlite3 需要原生编译）
-# 安装 python3、make、g++ 用于 node-gyp 编译，编译后立即清理
-RUN apk add --no-cache python3 make g++ \
-    && yarn install --ignore-engines \
-    && apk del python3 make g++ \
-    && rm -rf /var/cache/apk/*
+# 安装依赖（仅用于 tsc 编译，不需要 node-gyp 工具链）
+RUN yarn install --ignore-engines
 
-# 复制源码并编译
+# 复制源码并编译 TypeScript / 前端
 COPY . .
-# 清理 vender 内非运行时目录
 RUN rm -rf vender/cloud189-sdk/docs vender/cloud189-sdk/example \
            vender/cloud189-sdk/test vender/cloud189-sdk/.git \
            vender/cloud189-sdk/.vscode vender/cloud189-sdk/.github
-# 复制第三方前端组件到 public/vendor
 RUN node scripts/copy-vendor.js && npx tsc && cp -r src/public dist/public
-# 删除 vendor 内的 source map
 RUN find dist/public/vendor -name "*.js.map" -delete 2>/dev/null; true
 
-# 原地裁剪 node_modules 为纯生产依赖
-RUN yarn install --production --ignore-engines && \
-    yarn cache clean && \
-    find node_modules -name "*.d.ts" -delete && \
-    find node_modules -name "*.d.ts.map" -delete && \
-    find node_modules -name "*.js.map" -delete && \
-    rm -rf node_modules/typeorm/browser && \
-    find node_modules \( -name "README*" -o -name "CHANGELOG*" \) -not -path "*/bin/*" -delete 2>/dev/null; true
-
 # ── 生产阶段 ──────────────────────────────────────────────────────────────────
-# 生产阶段使用目标平台架构（arm/v7）
+# 在目标平台（armv7）上运行，编译原生模块
 FROM node:18-alpine AS production
 
 WORKDIR /home
 
 ARG APP_VERSION=dev
 
-# 安装系统运行时包、设置时区、创建持久化目录
-RUN apk add --no-cache ca-certificates tzdata && \
+# 安装运行时依赖 + 原生编译工具链（armv7 需要现场编译 better-sqlite3）
+RUN apk add --no-cache ca-certificates tzdata python3 make g++ && \
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo "Asia/Shanghai" > /etc/timezone && \
     mkdir -p /home/data /home/strm && \
     chown -R node:node /home
 
-# 复制 Builder 中已裁剪的 node_modules（同为 Alpine，原生库兼容）
-COPY --from=builder /home/node_modules ./node_modules
+# 复制 package.json 并在目标平台安装生产依赖（better-sqlite3 会编译出 armv7 原生模块）
+COPY package.json yarn.lock ./
+RUN yarn install --production --ignore-engines && \
+    yarn cache clean && \
+    # 清理编译后的开发工具链，减小镜像
+    apk del python3 make g++ && \
+    rm -rf /var/cache/apk/* && \
+    # 清理运行时不需要的文件
+    find node_modules -name "*.d.ts" -delete && \
+    find node_modules -name "*.d.ts.map" -delete && \
+    find node_modules -name "*.js.map" -delete && \
+    rm -rf node_modules/typeorm/browser && \
+    find node_modules \( -name "README*" -o -name "CHANGELOG*" \) -not -path "*/bin/*" -delete 2>/dev/null; true
+
+# 复制 builder 阶段编译好的 JS 和前端资源
 COPY --from=builder /home/dist ./dist
-# 兜底：显式复制前端静态资源
 COPY --from=builder /home/src/public ./dist/public
-COPY --from=builder /home/package.json ./
 
 ENV TZ=Asia/Shanghai
 ENV NODE_ENV=production
