@@ -1,14 +1,17 @@
 # ── 构建阶段 ──────────────────────────────────────────────────────────────────
-# better-sqlite3 提供 Alpine musl 预编译二进制，无需原生编译工具
-FROM node:18-alpine AS builder
+# 使用支持 armv7 的 Alpine 镜像，并通过 BUILDPLATFORM 实现跨平台构建
+FROM --platform=$BUILDPLATFORM node:18-alpine AS builder
 
 WORKDIR /home
 
 # 先复制依赖清单，充分利用 Docker 层缓存
 COPY package.json yarn.lock ./
 
-# 安装全部依赖（含 devDependencies，编译 TypeScript 需要）
-RUN yarn install --ignore-engines
+# 安装构建工具（armv7 下 better-sqlite3 可能需要原生编译）
+# 安装 python3、make、g++ 用于 node-gyp 编译
+RUN apk add --no-cache python3 make g++ \
+    && yarn install --ignore-engines \
+    && apk del python3 make g++  # 编译完成后立即清理，减小层体积
 
 # 复制源码并编译
 COPY . .
@@ -36,6 +39,7 @@ RUN yarn install --production --ignore-engines && \
     find node_modules \( -name "README*" -o -name "CHANGELOG*" \) -not -path "*/bin/*" -delete 2>/dev/null; true
 
 # ── 生产阶段 ──────────────────────────────────────────────────────────────────
+# 生产阶段使用目标平台架构（arm/v7）
 FROM node:18-alpine AS production
 
 WORKDIR /home
@@ -50,7 +54,8 @@ RUN apk add --no-cache ca-certificates tzdata && \
     chown -R node:node /home
 
 # 直接复制 Builder 中已裁剪的 node_modules（同为 Alpine，原生库完全兼容）
-# 无需在生产阶段重新执行 yarn install，节省镜像层和构建时间
+# 注意：如果 builder 阶段进行了原生编译，需确保 BUILDPLATFORM 与 TARGETPLATFORM 兼容
+# 或使用 QEMU 用户态模拟进行跨平台构建
 COPY --from=builder /home/node_modules ./node_modules
 COPY --from=builder /home/dist ./dist
 # 兜底：显式复制前端静态资源，防止 login.html 等页面缺失
